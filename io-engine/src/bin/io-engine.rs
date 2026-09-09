@@ -97,7 +97,17 @@ fn start_tokio_runtime(args: &MayastorCliArgs) {
 
     if args.rdma {
         env::set_var("ENABLE_RDMA", "true");
-        warn!("RDMA is requested to be enabled for Mayastor NVMEoF target");
+        // The nvmf target has been brought up by now, so rather than the
+        // request we can report what came of it.
+        let rdma_target = MayastorEnvironment::global().rdma_target();
+        if rdma_target {
+            warn!("RDMA is enabled for the Mayastor NVMEoF target");
+        } else {
+            warn!(
+                "RDMA was requested but is not available, \
+                the Mayastor NVMEoF target will only use tcp"
+            );
+        }
     }
 
     // Use as-is basis for diskpool encryption since the spdk build is enabled

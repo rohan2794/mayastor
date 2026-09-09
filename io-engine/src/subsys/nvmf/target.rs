@@ -167,7 +167,7 @@ impl Target {
     /// add the transport to the target
     fn add_transport(&self) {
         Reactors::master().send_future(async move {
-            let rdma = MayastorEnvironment::global_or_default().rdma();
+            let rdma = MayastorEnvironment::global_or_default().rdma_enabled();
             let ret = transport::create_and_add_transports(rdma).await;
             NVMF_TGT.with(|t| {
                 if ret.is_err() {
@@ -235,7 +235,7 @@ impl Target {
 
         if rc != 0 {
             return Err(Error::CreateTarget {
-                msg: "failed to back target".into(),
+                msg: "for the nexus".into(),
             });
         }
 
@@ -247,7 +247,7 @@ impl Target {
 
         if rc != 0 {
             return Err(Error::CreateTarget {
-                msg: "failed to front target".into(),
+                msg: "for the replica".into(),
             });
         }
         info!(
@@ -257,7 +257,7 @@ impl Target {
             trid_replica.trsvcid.as_str(),
         );
 
-        if MayastorEnvironment::global_or_default().rdma() {
+        if MayastorEnvironment::global_or_default().rdma_enabled() {
             // listen RDMA also.
             let _ = self
                 .listen_rdma()
@@ -266,12 +266,13 @@ impl Target {
                 })
                 .map_err(|e| {
                     warn!(
-                        "failed to listen rdma on address. err: {e}:\
-                        The target will however keep running with \
+                        "failed to listen rdma on address: {e}: the target will however keep running with \
                         only tcp listener, with performance expectations of tcp"
                     );
                 });
         }
+
+        MayastorEnvironment::global().set_nvmf_target(true, self.rdma);
 
         self.next_state();
         Ok(())
@@ -301,7 +302,7 @@ impl Target {
 
         if rc != 0 {
             return Err(Error::CreateTarget {
-                msg: "failed to back target".into(),
+                msg: "for the nexus".into(),
             });
         }
 
@@ -313,7 +314,7 @@ impl Target {
 
         if rc != 0 {
             return Err(Error::CreateTarget {
-                msg: "failed to front target".into(),
+                msg: "for the replica".into(),
             });
         }
         info!(
@@ -463,6 +464,8 @@ impl Target {
 
     /// start the shutdown of the target and subsystems
     pub(crate) fn start_shutdown(&mut self) {
+        // the target is going away, so nothing can be shared over it anymore.
+        MayastorEnvironment::global().set_nvmf_target(false, false);
         self.next_state = TargetState::ShutdownSubsystems;
         Reactors::master().send_future(async {
             NVMF_TGT.with(|tgt| {

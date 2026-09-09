@@ -22,6 +22,7 @@ impl From<BdevError> for tonic::Status {
             BdevError::UriParseFailed { .. } => Status::invalid_argument(e.to_string()),
             BdevError::UriSchemeUnsupported { .. } => Status::invalid_argument(e.to_string()),
             BdevError::InvalidUri { .. } => Status::invalid_argument(e.to_string()),
+            BdevError::RdmaUnavailable { .. } => Status::failed_precondition(e.to_string()),
             BdevError::IntParamParseFailed { .. } => Status::invalid_argument(e.to_string()),
             BdevError::BoolParamParseFailed { .. } => Status::invalid_argument(e.to_string()),
             BdevError::UuidParamParseFailed { .. } => Status::invalid_argument(e.to_string()),

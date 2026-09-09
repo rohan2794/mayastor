@@ -60,8 +60,14 @@ impl Default for NexusOpts {
         Self {
             nvmf_enable: true,
             nvmf_discovery_enable: true,
-            nvmf_nexus_port: NVMF_PORT_NEXUS,
-            nvmf_replica_port: NVMF_PORT_REPLICA,
+            nvmf_nexus_port: std::env::var("NVMF_PORT_NEXUS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(NVMF_PORT_NEXUS),
+            nvmf_replica_port: std::env::var("NVMF_PORT_REPLICA")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(NVMF_PORT_REPLICA),
         }
     }
 }

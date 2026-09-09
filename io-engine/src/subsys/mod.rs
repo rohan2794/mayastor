@@ -18,7 +18,7 @@ pub use registration::{registration_grpc::Registration, RegistrationSubsystem};
 use crate::subsys::nvmf::Nvmf;
 
 pub(super) mod config;
-mod nvmf;
+pub(crate) mod nvmf;
 /// Module for managing of the nvmx admin queues.
 pub mod nvmx;
 /// Module for registration of the data-plane with control-plane

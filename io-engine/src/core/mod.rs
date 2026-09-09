@@ -21,8 +21,8 @@ pub use device_events::{
 };
 pub use device_monitor::{device_cmd_queue, device_monitor_loop, DeviceCommand};
 pub use env::{
-    mayastor_env_stop, MayastorCliArgs, MayastorEnvironment, NvmeCliArgs, PoolCliArgs, GLOBAL_RC,
-    SIG_RECEIVED,
+    mayastor_env_stop, MayastorCliArgs, MayastorEnvironment, NvmeCliArgs, PoolCliArgs, RdmaState,
+    GLOBAL_RC, SIG_RECEIVED,
 };
 pub use handle::{BdevHandle, UntypedBdevHandle};
 pub use io_device::IoDevice;
@@ -318,20 +318,23 @@ pub struct MayastorFeatures {
     pub logical_volume_manager: bool,
     /// When set to true, support for snapshot rebuild is enabled.
     pub snapshot_rebuild: bool,
-    /// When set to true, the io-engine instance supports RDMA transport.
+    /// When set to true, this io-engine can use the RDMA transport, which
+    /// says nothing about rdma being usable on this host, see
+    /// [`NvmfTargetInfo`].
     pub rdma_capable_io_engine: bool,
     /// Diskpool encryption capability.
     pub diskpool_encryption: bool,
     /// Nexus label versioning capability.
     pub nexus_label_version: u32,
 }
+
 impl MayastorFeatures {
     /// Check if LVM feature is enabled.
     pub fn lvm(&self) -> bool {
         self.logical_volume_manager
     }
 
-    /// Get nvmf target's rdma feature state.
+    /// Get this io-engine's rdma capability.
     pub fn rdma_capable_io_engine(&self) -> bool {
         self.rdma_capable_io_engine
     }
@@ -340,6 +343,34 @@ impl MayastorFeatures {
     pub fn nexus_label_version(&self) -> u32 {
         self.nexus_label_version
     }
+}
+
+/// The transport capabilities of the node we run on, to expose to the
+/// control-plane. Computed the same way as the csi node does, so that both
+/// report the same thing.
+#[derive(Debug, Default, Clone)]
+pub struct TransportCaps {
+    /// RDMA HCA hardware is present on this node.
+    pub rdma_hca_present: bool,
+    /// The nvme_rdma kernel module is loaded on this node. We don't use it
+    /// ourselves, as we do rdma from userspace, but the node's initiator
+    /// needs it to connect over rdma.
+    pub nvme_rdma_module_loaded: bool,
+}
+
+/// The state of our nvmf target, to expose to the control-plane. Unlike the
+/// features, this is not what we're capable of but what we ended up with.
+#[derive(Debug, Default, Clone)]
+pub struct NvmfTargetInfo {
+    /// The network interface the target listens on, if one was specified.
+    pub interface: Option<String>,
+    /// The address the target listens on.
+    pub address: String,
+    /// Whether the target is listening over tcp, unset if it wasn't asked to.
+    pub tcp: Option<bool>,
+    /// Whether the target is listening over rdma, which is what makes rdma
+    /// usable, unset if it wasn't asked to.
+    pub rdma: Option<bool>,
 }
 
 /// Bugfix information to expose to the control-plane.

@@ -25,6 +25,12 @@ pub enum BdevError {
     // Scheme-specific URI format errors.
     #[snafu(display("Invalid URI '{}': {}", uri, message))]
     InvalidUri { uri: String, message: String },
+    // The URI requires RDMA, which this node can't do.
+    #[snafu(display(
+        "Cannot connect to '{uri}' over RDMA as RDMA is not available on this node, \
+        and falling back to TCP is not enabled"
+    ))]
+    RdmaUnavailable { uri: String },
     // Bad value of a boolean parameter.
     #[snafu(display(
         "Invalid URI '{}': could not parse value of parameter '{}': '{}' is given, \
@@ -99,6 +105,7 @@ impl ToErrno for BdevError {
             BdevError::BdevNoMatchingUri { .. } => Errno::EPIPE,
             BdevError::UriSchemeUnsupported { .. } => Errno::ENOTSUP,
             BdevError::InvalidUri { .. } => Errno::EINVAL,
+            BdevError::RdmaUnavailable { .. } => Errno::ENOTSUP,
             BdevError::BoolParamParseFailed { .. } => Errno::EINVAL,
             BdevError::IntParamParseFailed { .. } => Errno::EINVAL,
             BdevError::UuidParamParseFailed { .. } => Errno::EINVAL,

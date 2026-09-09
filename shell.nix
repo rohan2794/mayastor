@@ -69,7 +69,7 @@ let
         # SRCDIR is needed by docker-compose files as it requires absolute paths
         export SRCDIR=`pwd`
 
-        export PATH="$PATH:$(pwd)/scripts/nix-sudo"
+        export PATH="$(pwd)/target/debug:$PATH:$(pwd)/scripts/nix-sudo"
 
         export IO_ENGINE_DIR="$RUST_TARGET_DEBUG"
 

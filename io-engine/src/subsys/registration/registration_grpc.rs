@@ -1,6 +1,6 @@
 #![warn(missing_docs)]
 
-use crate::core::{MayastorBugFixes, MayastorFeatures};
+use crate::core::{MayastorBugFixes, MayastorEnvironment, MayastorFeatures};
 use futures::{select, FutureExt, StreamExt};
 use http::Uri;
 use io_engine_api::v1::registration::{
@@ -159,6 +159,8 @@ impl Registration {
             features: Some(MayastorFeatures::get().into()),
             bugfixes: Some(MayastorBugFixes::get().into()),
             version: Some(raw_version_string()),
+            nvmf_target: Some(MayastorEnvironment::nvmf_target_info().into()),
+            transport_caps: Some(MayastorEnvironment::transport_caps().into()),
         };
         self.client
             .register(tonic::Request::new(register))

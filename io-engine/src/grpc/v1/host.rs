@@ -1,6 +1,9 @@
 use crate::{
     bdev::{nexus, NvmeControllerState},
-    core::{BlockDeviceIoStats, CoreError, MayastorBugFixes, MayastorFeatures},
+    core::{
+        BlockDeviceIoStats, CoreError, MayastorBugFixes, MayastorEnvironment, MayastorFeatures,
+        NvmfTargetInfo, TransportCaps,
+    },
     grpc::{
         controller_grpc::{controller_stats, list_controllers, NvmeControllerInfo},
         rpc_submit, GrpcClientContext, GrpcResult, Serializer,
@@ -104,6 +107,27 @@ impl From<MayastorFeatures> for host_rpc::MayastorFeatures {
         }
     }
 }
+
+impl From<TransportCaps> for host_rpc::TransportCaps {
+    fn from(c: TransportCaps) -> Self {
+        Self {
+            rdma_hca_present: c.rdma_hca_present,
+            nvme_rdma_module_loaded: c.nvme_rdma_module_loaded,
+        }
+    }
+}
+
+impl From<NvmfTargetInfo> for host_rpc::NvmfTargetInfo {
+    fn from(t: NvmfTargetInfo) -> Self {
+        Self {
+            interface: t.interface,
+            address: t.address,
+            tcp: t.tcp,
+            rdma: t.rdma,
+        }
+    }
+}
+
 impl From<MayastorFeatures> for host_rpc::BackCompatMayastorFeatures {
     fn from(f: MayastorFeatures) -> Self {
         Self {
@@ -243,6 +267,8 @@ impl host_rpc::HostRpc for HostService {
                 features: Some(MayastorFeatures::get().into()),
                 bugfixes: Some(MayastorBugFixes::get().into()),
                 version: Some(raw_version_string()),
+                nvmf_target: Some(MayastorEnvironment::nvmf_target_info().into()),
+                transport_caps: Some(MayastorEnvironment::transport_caps().into()),
             }),
         };
 

@@ -1,7 +1,7 @@
 use std::{
     env,
     ffi::CString,
-    os::raw::{c_char, c_void},
+    os::raw::{c_char, c_int, c_void},
     pin::Pin,
     str::FromStr,
     sync::{
@@ -25,10 +25,11 @@ use spdk_rs::{
     libspdk::{
         spdk_app_shutdown_cb, spdk_env_dpdk_post_init, spdk_env_dpdk_rte_eal_init, spdk_env_fini,
         spdk_log_close, spdk_log_level, spdk_log_open, spdk_log_set_flag, spdk_log_set_level,
-        spdk_log_set_print_level, spdk_pci_addr, spdk_rpc_finish, spdk_rpc_initialize,
-        spdk_rpc_set_state, spdk_subsystem_fini, spdk_subsystem_init, spdk_thread_lib_fini,
-        spdk_thread_send_critical_msg, spdk_trace_cleanup, spdk_trace_create_tpoint_group_mask,
-        spdk_trace_init, spdk_trace_set_tpoints, SPDK_LOG_DEBUG, SPDK_LOG_INFO, SPDK_RPC_RUNTIME,
+        spdk_log_set_print_level, spdk_nvme_transport_available_by_name, spdk_pci_addr,
+        spdk_rpc_finish, spdk_rpc_initialize, spdk_rpc_set_state, spdk_subsystem_fini,
+        spdk_subsystem_init, spdk_thread_lib_fini, spdk_thread_send_critical_msg,
+        spdk_trace_cleanup, spdk_trace_create_tpoint_group_mask, spdk_trace_init,
+        spdk_trace_set_tpoints, SPDK_LOG_DEBUG, SPDK_LOG_INFO, SPDK_RPC_RUNTIME,
     },
     spdk_rs_log,
 };
@@ -40,7 +41,7 @@ use crate::{
         nic,
         nic::SIpAddr,
         reactor::{Reactor, ReactorState, Reactors},
-        Cores, MayastorFeatures, Mthread,
+        Cores, MayastorFeatures, Mthread, NvmfTargetInfo, TransportCaps,
     },
     eventing::{io_engine_events::io_engine_stop_event_meta, Event, EventWithMeta},
     grpc,
@@ -49,8 +50,8 @@ use crate::{
     logger::FmtSpan,
     persistent_store::PersistentStoreBuilder,
     subsys::{
-        self, config::opts::TARGET_CRDT_LEN, registration::registration_grpc::ApiVersion, Config,
-        PoolConfig, Registration,
+        self, config::opts::TARGET_CRDT_LEN, nvmf::transport::RDMA_TRANSPORT,
+        registration::registration_grpc::ApiVersion, Config, PoolConfig, Registration,
     },
 };
 
@@ -286,6 +287,11 @@ pub struct MayastorCliArgs {
     /// Enables RDMA between initiator and Mayastor Nvmf target.
     #[clap(long = "enable-rdma", env = "ENABLE_RDMA", value_parser = delay_compat)]
     pub rdma: bool,
+    /// Enable falling back to nvmf connect over tcp if this node is not rdma capable, {n}
+    /// even though the target is rdma capable. {n}
+    /// Otherwise, the connection fails.
+    #[clap(long, env = "NVME_CONNECT_FALLBACK", value_parser = delay_compat)]
+    pub nvme_connect_fallback: bool,
     /// Enables globally blob store cluster release on unmap.
     #[clap(long, env = "ENABLE_BS_CLUSTER_UNMAP", hide = true)]
     pub bs_cluster_unmap: bool,
@@ -302,7 +308,7 @@ pub struct MayastorCliArgs {
     /// round-robin over remote readers only when no local reader is
     /// healthy.
     #[clap(
-        long = "policy",
+        long,
         env = "NEXUS_READ_POLICY",
         default_value_t = nexus::NexusReadPolicy::RoundRobin
     )]
@@ -433,6 +439,39 @@ fn delay_compat(s: &str) -> Result<bool, String> {
     }
 }
 
+/// The RDMA state of an io-engine which has been asked for RDMA.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RdmaState {
+    /// Our nvmf target is listening over rdma, which means spdk found usable
+    /// rdma devices and managed to bind them.
+    target: bool,
+    /// Fall back to tcp when connecting to an rdma capable target from here,
+    /// rather than failing the connection, if we can't do rdma after all.
+    fallback: bool,
+}
+
+impl RdmaState {
+    /// Get the RDMA state of an io-engine which has yet to bring up its
+    /// target, with the given connect fallback.
+    fn new(fallback: bool) -> Self {
+        Self {
+            target: false,
+            fallback,
+        }
+    }
+
+    /// Check if our nvmf target is listening over rdma.
+    pub fn target(&self) -> bool {
+        self.target
+    }
+
+    /// Check if we may fall back to tcp when connecting to an rdma capable
+    /// target and we can't do rdma, rather than failing the connection.
+    pub fn fallback(&self) -> bool {
+        self.fallback
+    }
+}
+
 /// Mayastor features.
 impl MayastorFeatures {
     fn init_features() -> MayastorFeatures {
@@ -549,7 +588,12 @@ pub struct MayastorEnvironment {
     pub nexus_read_policy: nexus::NexusReadPolicy,
     developer_delay: bool,
     interrupt_mode: bool,
-    rdma: bool,
+    /// The RDMA state, set only if RDMA has been requested.
+    rdma: Option<RdmaState>,
+    /// Our nvmf target is listening over tcp.
+    tcp_target: bool,
+    /// The transport capabilities of the node we run on.
+    transport_caps: TransportCaps,
     bs_cluster_unmap: bool,
     pub pool_args: PoolCliArgs,
     pub nvme: NvmeCliArgs,
@@ -602,7 +646,9 @@ impl Default for MayastorEnvironment {
             nexus_read_policy: nexus::NexusReadPolicy::default(),
             developer_delay: false,
             interrupt_mode: false,
-            rdma: false,
+            rdma: None,
+            tcp_target: false,
+            transport_caps: TransportCaps::default(),
             bs_cluster_unmap: false,
             pool_args: PoolCliArgs::default(),
             traces: SpdkTracingArgs::default(),
@@ -709,6 +755,13 @@ struct SubsystemCtx {
     sender: futures::channel::oneshot::Sender<bool>,
 }
 
+// libibverbs, which spdk itself uses to enumerate the rdma devices, and which
+// `ibv_devinfo` reports from. It's already linked in for spdk's sake.
+extern "C" {
+    fn ibv_get_device_list(num_devices: *mut c_int) -> *mut *mut c_void;
+    fn ibv_free_device_list(list: *mut *mut c_void);
+}
+
 static MAYASTOR_FEATURES: OnceCell<MayastorFeatures> = OnceCell::new();
 
 static MAYASTOR_DEFAULT_ENV: OnceCell<parking_lot::Mutex<MayastorEnvironment>> = OnceCell::new();
@@ -749,7 +802,9 @@ impl MayastorEnvironment {
             skip_sig_handler: args.skip_sig_handler,
             developer_delay: args.developer_delay,
             interrupt_mode: args.interrupt_mode,
-            rdma: args.rdma,
+            rdma: args
+                .rdma
+                .then_some(RdmaState::new(args.nvme_connect_fallback)),
             bs_cluster_unmap: args.bs_cluster_unmap,
             enable_io_all_thrd_nexus_channels: args.enable_io_all_thrd_nexus_channels,
             nexus_read_policy: args.nexus_read_policy,
@@ -951,9 +1006,101 @@ impl MayastorEnvironment {
             .cloned()
     }
 
-    /// Check if RDMA needs to be enabled for Mayastor nvmf target.
-    pub fn rdma(&self) -> bool {
+    /// Get the RDMA state of the Mayastor nvmf target, set only if RDMA has
+    /// been requested for it, which says nothing about it being possible, see
+    /// [`Self::rdma_enabled`].
+    pub fn rdma(&self) -> Option<RdmaState> {
         self.rdma
+    }
+
+    /// Check if RDMA needs to be enabled for Mayastor nvmf target: it has been
+    /// requested and spdk has been built with rdma support.
+    /// Whether this host can actually do rdma is only known once we've tried, see [`Self::rdma_target`].
+    pub fn rdma_enabled(&self) -> bool {
+        self.rdma.is_some() && Self::rdma_transport_registered()
+    }
+
+    /// Check if our nvmf target is listening over rdma, which means spdk found
+    /// usable rdma devices and managed to bind them.
+    /// We also take this as proof that we can connect to remote targets over rdma.
+    /// # NOTE
+    /// This isn't strictly true as we may still be able to connect to remote targets even if
+    /// the nvmf target isn't listening over rdma, but it's a good enough proxy for now.
+    pub fn rdma_target(&self) -> bool {
+        self.rdma.is_some_and(|rdma| rdma.target())
+    }
+
+    /// Get the state of our nvmf target, to report to the control-plane.
+    pub fn nvmf_target_info() -> NvmfTargetInfo {
+        let env = Self::global_or_default();
+        NvmfTargetInfo {
+            interface: env.nvmf_tgt_interface.clone(),
+            // The listeners all share the target's address, they only differ
+            // in transport and port.
+            address: Self::get_nvmf_tgt_ip()
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            // Tcp is always asked for, rdma only through --enable-rdma, and
+            // either is true only once the target has bound it.
+            tcp: Some(env.tcp_target),
+            rdma: env.rdma.map(|rdma| rdma.target()),
+        }
+    }
+
+    /// Record which transports our nvmf target is listening over.
+    pub(crate) fn set_nvmf_target(&mut self, tcp: bool, rdma: bool) {
+        self.tcp_target = tcp;
+        if let Some(state) = self.rdma.as_mut() {
+            state.target = rdma;
+        }
+    }
+
+    /// Get the transport capabilities of the node we run on, as detected
+    /// during start-up.
+    pub fn transport_caps() -> TransportCaps {
+        Self::global_or_default().transport_caps.clone()
+    }
+
+    /// Detects the node's transport capabilities, the same way the csi node
+    /// does so that both report the same thing.
+    fn detect_transport_caps() -> TransportCaps {
+        let caps = TransportCaps {
+            rdma_hca_present: Self::rdma_hca_present(),
+            nvme_rdma_module_loaded: std::fs::metadata("/sys/module/nvme_rdma").is_ok(),
+        };
+        if caps.rdma_hca_present && !caps.nvme_rdma_module_loaded {
+            warn!(
+                "This node has rdma hardware but the nvme_rdma kernel module is not loaded, \
+                so its initiator can't connect over rdma"
+            );
+        }
+        debug!("Node transport capabilities: {caps:?}");
+        caps
+    }
+
+    /// Checks if rdma hca hardware is present on this node, which is the same
+    /// thing `ibv_devinfo -l` reports, only asked straight to libibverbs.
+    fn rdma_hca_present() -> bool {
+        let mut devices: c_int = 0;
+        // Only enumerates the devices, it doesn't open them, so it can't
+        // upset the rdma_cm devices spdk opens later on.
+        let list = unsafe { ibv_get_device_list(&mut devices) };
+        if list.is_null() {
+            // Errno says why, but either way we have no hardware to use.
+            debug!("Failed to enumerate the rdma devices");
+            return false;
+        }
+        unsafe { ibv_free_device_list(list) };
+        devices > 0
+    }
+
+    /// Checks with spdk if the nvme(host side) rdma transport is registered,
+    /// which is only the case if spdk has been built with rdma support. The
+    /// nvme and nvmf rdma transports are built together, so this tells us
+    /// about both. The transports register themselves before main() runs, so
+    /// this can be called at any point during start-up.
+    fn rdma_transport_registered() -> bool {
+        unsafe { spdk_nvme_transport_available_by_name(RDMA_TRANSPORT.as_ptr()) }
     }
 
     /// Detects IP address for NVMF target by the interface specified in CLI
@@ -1151,6 +1298,17 @@ impl MayastorEnvironment {
         // setup the logger as soon as possible
         self.init_logger();
 
+        // rdma can't be used at all if spdk hasn't been built with it, no
+        // matter what has been requested.
+        if self.rdma.is_some() && !Self::rdma_transport_registered() {
+            warn!("RDMA was requested but spdk has not been built with rdma support");
+        }
+
+        // Detect what the node can do before the eal takes over its memory,
+        // as this shells out to ibv_devinfo.
+        self.transport_caps = Self::detect_transport_caps();
+        self = self.setup_static();
+
         if option_env!("ASAN_ENABLE").unwrap_or_default() == "1" {
             print_asan_env();
         }
@@ -1346,4 +1504,23 @@ fn print_asan_env() {
     print_compile_var!("CARGO_BUILD_TARGET");
     print_compile_var!("CARGO_PROFILE_DEV_PANIC");
     print_run_var("RUST_BACKTRACE");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rdma transports must be registered with spdk, otherwise rdma can
+    /// never be used, no matter the platform.
+    #[test]
+    fn rdma_transport_registered() {
+        let tcp = CString::new("TCP").unwrap();
+        let bogus = CString::new("NOT_A_TRANSPORT").unwrap();
+
+        // sanity check the transport lookup itself.
+        assert!(unsafe { spdk_nvme_transport_available_by_name(tcp.as_ptr()) });
+        assert!(!unsafe { spdk_nvme_transport_available_by_name(bogus.as_ptr()) });
+
+        assert!(MayastorEnvironment::rdma_transport_registered());
+    }
 }

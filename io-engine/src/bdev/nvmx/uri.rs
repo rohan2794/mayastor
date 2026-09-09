@@ -20,6 +20,7 @@ use std::{
 use url::Url;
 use uuid::Uuid;
 
+use super::controller::transport::{NvmeTransportId, TrType};
 use controller::options::NvmeControllerOpts;
 
 use spdk_rs::{
@@ -44,8 +45,6 @@ use crate::{
     ffihelper::ErrnoResult,
     subsys::Config,
 };
-
-use super::controller::transport::NvmeTransportId;
 
 const DEFAULT_NVMF_PORT: u16 = 8420;
 // Callback to be called once NVMe controller attach sequence completes.
@@ -103,6 +102,8 @@ pub struct NvmfDeviceTemplate {
     uuid: Option<uuid::Uuid>,
     /// The HostNqn to connect to the nvmf target with.
     hostnqn: Option<String>,
+    /// Don't ignore transport type
+    trtype: TrType,
 }
 
 impl TryFrom<&Url> for NvmfDeviceTemplate {
@@ -165,6 +166,30 @@ impl TryFrom<&Url> for NvmfDeviceTemplate {
             .trim_start_matches("[")
             .trim_end_matches("]")
             .to_string();
+
+        let trtype = match url.scheme() {
+            "nvmf" | "nvmf+tcp" => Ok(TrType::TCP),
+            // The target we're connecting to supports rdma, but we can only
+            // make use of it if this host can do rdma as well, which our own
+            // target having bound rdma is proof of.
+            "nvmf+rdma+tcp" => match MayastorEnvironment::global().rdma() {
+                None => Ok(TrType::TCP),
+                Some(rdma) if rdma.target() => Ok(TrType::RDMA),
+                Some(rdma) if rdma.fallback() => {
+                    warn!("RDMA is enabled but not available, connecting to {url} over tcp");
+                    Ok(TrType::TCP)
+                }
+                Some(_) => Err(BdevError::RdmaUnavailable {
+                    uri: url.to_string(),
+                }),
+            },
+            other => Err(BdevError::InvalidUri {
+                uri: url.to_string(),
+                message: format!("unsupported nvmf scheme '{other}'"),
+            }),
+        }?;
+        warn!("Connecting to {url} over {trtype:?}");
+
         Ok(NvmfDeviceTemplate {
             name: url[url::Position::BeforeHost..url::Position::AfterPath].to_string(),
             alias: url.to_string(),
@@ -174,6 +199,7 @@ impl TryFrom<&Url> for NvmfDeviceTemplate {
             prchk_flags,
             uuid,
             hostnqn,
+            trtype,
         })
     }
 }
@@ -205,6 +231,7 @@ pub(crate) struct NvmeControllerContext<'probe> {
 impl NvmeControllerContext<'_> {
     pub fn new(template: &NvmfDeviceTemplate) -> NvmeControllerContext<'_> {
         let trid = controller::transport::Builder::new()
+            .with_trtype(template.trtype)
             .with_subnqn(&template.subnqn)
             .with_svcid(template.port.to_string())
             .with_traddr(&template.host)

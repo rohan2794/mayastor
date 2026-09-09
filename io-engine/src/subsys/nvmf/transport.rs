@@ -59,6 +59,9 @@ pub async fn create_and_add_transports(add_rdma: bool) -> Result<(), Error> {
     if add_rdma {
         info!("Adding RDMA transport for Mayastor Nvmf target");
         let mut opts = cfg.nvmf_tgt_conf.opts_rdma.into();
+        // Creating the transport is also how we find out if RDMA is at all
+        // possible here: spdk enumerates the rdma devices while doing so and
+        // fails if this host has none which it can use.
         let transport = unsafe { spdk_nvmf_transport_create(RDMA_TRANSPORT.as_ptr(), &mut opts) };
 
         let ret = transport.to_result(|_| Error::Transport {
@@ -69,9 +72,8 @@ pub async fn create_and_add_transports(add_rdma: bool) -> Result<(), Error> {
         if let Err(e) = ret {
             // todo: add event mechanism for Target and Nvmfsubsystem
             warn!(
-                "RDMA enablement failed {e}.\
-                The target will however keep running with only tcp, \
-                with performance expectations of tcp."
+                "RDMA enablement failed {e}. The target will however keep running with only tcp, \
+                with the performance expectations of tcp."
             );
             return Ok(());
         }
@@ -88,8 +90,14 @@ pub async fn create_and_add_transports(add_rdma: bool) -> Result<(), Error> {
             })
         };
 
-        let _result = r.await.ok();
-        debug!("Added RDMA nvmf transport");
+        match r.await.ok().and_then(|result| result.ok()) {
+            Some(_) => debug!("Added RDMA nvmf transport"),
+            None => warn!(
+                "Failed to add the RDMA transport to the nvmf target. \
+                The target will however keep running with only tcp, \
+                with the performance expectations of tcp."
+            ),
+        }
     }
 
     Ok(())

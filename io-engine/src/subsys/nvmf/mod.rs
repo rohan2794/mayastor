@@ -28,7 +28,7 @@ mod admin_cmd;
 mod poll_groups;
 mod subsystem;
 mod target;
-mod transport;
+pub(crate) mod transport;
 
 // wrapper around our NVMF subsystem used for registration
 pub struct Nvmf(pub(crate) *mut spdk_subsystem);
