@@ -1,23 +1,25 @@
-//! Integration coverage for `GetPoolHealth`, requested on PR #2029 review
+//! Integration coverage for `ListPoolHealth`, requested on PR #2029 review
 //! ("There's no integration tests (ie `io-engine/tests`). Can we use loop
 //! device to at least check it runs without panic?").
 //!
-//! Exercises the real dispatch path end to end -- `PoolOps::
-//! read_device_health` -> `Lvs`'s bdev-resolving override -> `device_health()`
-//! -> `smartctl` -- against pools backed by real (if virtual) kernel block
-//! devices, confirming it completes gracefully (`Ok` or a well-formed `Err`)
-//! rather than panicking, on two device classes:
+//! Exercises the real dispatch path end to end via the `ListPoolHealth` gRPC
+//! call -- `list_pool_health` handler -> `PoolOps::read_device_health` ->
+//! `Lvs`'s bdev-resolving override -> `device_health()` -> `smartctl` --
+//! against pools backed by real (if virtual) kernel block devices, confirming
+//! the gRPC response is well-formed and completes gracefully on two device
+//! classes:
 //! - a loop device (`losetup`) -- unsupported by smartctl, exercises the
-//!   error path.
+//!   error path (DiskHealth::supported == false).
 //! - a `scsi_debug` device -- exercises the SCSI-flavoured success path,
 //!   including the `logical_unit_id` WWN fallback (see `device_health.rs`).
 
 use common::MayastorTest;
 use io_engine::{
-    core::{CoreError, MayastorCliArgs},
+    core::MayastorCliArgs,
     lvs::Lvs,
-    pool_backend::{IPoolProps, PoolArgs, PoolBackend, PoolOps},
+    pool_backend::{PoolArgs, PoolBackend},
 };
+use io_engine_api::v1::pool::{ListPoolHealthOptions, PoolRpcClient};
 use once_cell::sync::OnceCell;
 
 pub mod common;
@@ -39,6 +41,12 @@ fn ms() -> &'static MayastorTest<'static> {
     ms
 }
 
+async fn pool_grpc_client() -> PoolRpcClient<tonic::transport::Channel> {
+    PoolRpcClient::connect("http://127.0.0.1:10124")
+        .await
+        .expect("failed to connect to gRPC server")
+}
+
 #[tokio::test]
 async fn pool_health_on_loop_device_does_not_panic() {
     let ms = ms();
@@ -54,41 +62,55 @@ async fn pool_health_on_loop_device_does_not_panic() {
     let ldev = common::setup_loopdev_file(DISKNAME, None);
 
     let ldev_pool = ldev.clone();
-    ms.spawn(async move {
-        let pool = Lvs::create_or_import(PoolArgs {
-            name: "pool_health_test".into(),
-            disks: vec![format!("aio://{ldev_pool}")],
-            backend: PoolBackend::Lvs,
-            ..Default::default()
+    let pool_name = "pool_health_test";
+    ms.spawn({
+        let pool_name = pool_name.to_string();
+        async move {
+            Lvs::create_or_import(PoolArgs {
+                name: pool_name,
+                disks: vec![format!("aio://{ldev_pool}")],
+                backend: PoolBackend::Lvs,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+    })
+    .await;
+
+    let mut client = pool_grpc_client().await;
+    let response = client
+        .list_pool_health(ListPoolHealthOptions {
+            name: Some(pool_name.to_string()),
+            uuid: None,
+            pooltype: None,
         })
         .await
-        .unwrap();
+        .expect("list_pool_health gRPC call failed")
+        .into_inner();
 
-        let disk = pool.disks().into_iter().next().expect("pool has a disk");
+    assert_eq!(response.pools.len(), 1, "expected exactly one pool");
+    let pool_health = &response.pools[0];
+    assert_eq!(pool_health.name, pool_name);
+    assert!(!pool_health.disks.is_empty(), "expected at least one disk");
 
-        // A loop device is virtual, so smartctl typically can't identify it
-        // ("Unable to detect device type" -> ENXIO, confirmed against real
-        // hardware) -- or, if smartctl itself isn't installed in whatever
-        // environment runs this test, the subprocess fails to even spawn
-        // (ENOENT) instead. Both are the same graceful `CoreError`; what
-        // matters here is that neither path panics.
-        match pool.read_device_health(&disk).await {
-            Ok(health) => {
-                // Not the expected outcome for a loop device, but not itself
-                // a bug -- just confirm decoding whatever smartctl reported
-                // didn't panic.
-                dbg!(health.is_healthy());
-            }
-            Err(error) => {
-                assert!(
-                    matches!(error, CoreError::SmartctlFailed { .. }),
-                    "unexpected error variant: {:?}",
-                    error
-                );
-            }
+    // A loop device is virtual, so smartctl typically can't identify it --
+    // the disk should be reported as unsupported (or, if smartctl happens to
+    // work, at least the response is well-formed).
+    let disk = &pool_health.disks[0];
+    if !disk.supported {
+        assert!(
+            disk.error.is_some(),
+            "unsupported disk should have an error message"
+        );
+    }
+
+    ms.spawn({
+        let pool_name = pool_name.to_string();
+        async move {
+            let pool = Lvs::lookup(&pool_name).unwrap();
+            pool.destroy().await.unwrap();
         }
-
-        pool.destroy().await.unwrap();
     })
     .await;
 
@@ -109,41 +131,70 @@ async fn pool_health_on_scsi_debug_device_does_not_panic() {
     let dev = common::setup_scsi_debug_device(64);
 
     let dev_pool = dev.clone();
-    ms.spawn(async move {
-        let pool = Lvs::create_or_import(PoolArgs {
-            name: "pool_health_scsi_test".into(),
-            disks: vec![format!("aio://{dev_pool}")],
-            backend: PoolBackend::Lvs,
-            ..Default::default()
+    let pool_name = "pool_health_scsi_test";
+    ms.spawn({
+        let pool_name = pool_name.to_string();
+        async move {
+            Lvs::create_or_import(PoolArgs {
+                name: pool_name,
+                disks: vec![format!("aio://{dev_pool}")],
+                backend: PoolBackend::Lvs,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+    })
+    .await;
+
+    let mut client = pool_grpc_client().await;
+    let response = client
+        .list_pool_health(ListPoolHealthOptions {
+            name: Some(pool_name.to_string()),
+            uuid: None,
+            pooltype: None,
         })
         .await
-        .unwrap();
+        .expect("list_pool_health gRPC call failed")
+        .into_inner();
 
-        let disk = pool.disks().into_iter().next().expect("pool has a disk");
+    assert_eq!(response.pools.len(), 1, "expected exactly one pool");
+    let pool_health = &response.pools[0];
+    assert_eq!(pool_health.name, pool_name);
+    assert!(!pool_health.disks.is_empty(), "expected at least one disk");
 
-        match pool.read_device_health(&disk).await {
-            Ok(health) => {
-                let identity = health.identity.expect("scsi_debug reports identity");
-                assert_eq!(identity.model.as_deref(), Some("Linux scsi_debug"));
-                assert!(
-                    identity.wwn.is_some(),
-                    "expected a logical_unit_id-derived wwn"
-                );
-            }
-            Err(error) => {
-                // Only acceptable if smartctl itself isn't installed in
-                // whatever environment runs this test -- scsi_debug is a
-                // real device as far as smartctl is concerned, so anything
-                // else here would be a genuine bug.
-                assert!(
-                    matches!(error, CoreError::SmartctlFailed { .. }),
-                    "unexpected error variant: {:?}",
-                    error
-                );
-            }
+    let disk = &pool_health.disks[0];
+    if disk.supported {
+        let health = disk
+            .health
+            .as_ref()
+            .expect("supported disk should have health");
+        let identity = health
+            .identity
+            .as_ref()
+            .expect("scsi_debug reports identity");
+        assert_eq!(identity.model.as_deref(), Some("Linux scsi_debug"));
+        assert!(
+            identity.wwn.is_some(),
+            "expected a logical_unit_id-derived wwn"
+        );
+    } else {
+        // Only acceptable if smartctl itself isn't installed in
+        // whatever environment runs this test -- scsi_debug is a
+        // real device as far as smartctl is concerned, so anything
+        // else here would be a genuine bug.
+        assert!(
+            disk.error.is_some(),
+            "unsupported disk should have an error message"
+        );
+    }
+
+    ms.spawn({
+        let pool_name = pool_name.to_string();
+        async move {
+            let pool = Lvs::lookup(&pool_name).unwrap();
+            pool.destroy().await.unwrap();
         }
-
-        pool.destroy().await.unwrap();
     })
     .await;
 

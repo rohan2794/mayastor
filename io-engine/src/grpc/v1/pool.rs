@@ -91,11 +91,6 @@ impl From<ClearErrorRequest> for FindPoolArgs {
         Self::name_uuid(value.name, &value.uuid)
     }
 }
-impl From<GetPoolHealthRequest> for FindPoolArgs {
-    fn from(value: GetPoolHealthRequest) -> Self {
-        Self::name_uuid(value.name, &value.uuid)
-    }
-}
 
 impl From<crate::core::DeviceHealth> for DeviceHealth {
     fn from(h: crate::core::DeviceHealth) -> Self {
@@ -919,38 +914,74 @@ impl PoolRpc for PoolService {
     }
 
     #[named]
-    async fn get_pool_health(
+    async fn list_pool_health(
         &self,
-        request: Request<GetPoolHealthRequest>,
-    ) -> GrpcResult<GetPoolHealthResponse> {
+        request: Request<ListPoolHealthOptions>,
+    ) -> GrpcResult<ListPoolHealthResponse> {
         self.locked(
             GrpcClientContext::new(&request, function_name!()),
             async move {
                 crate::spdk_submit!(async move {
                     info!("{:?}", request.get_ref());
 
-                    let pool = GrpcPoolFactory::finder(request.into_inner()).await?;
+                    let args = request.into_inner();
+                    let pool_type = args.pooltype.as_ref().map(|v| v.value);
+                    let pool_type = match pool_type {
+                        None => None,
+                        Some(pool_type) => Some(
+                            PoolType::try_from(pool_type)
+                                .map_err(|_| Status::invalid_argument("Unknown pool type"))?,
+                        ),
+                    };
 
-                    let uris = pool.disks();
-                    let mut disks = Vec::with_capacity(uris.len());
-                    for uri in uris {
-                        // Dispatch — plain kernel path (LVM) vs. registered bdev (LVS), and
-                        // within that smartctl vs. NVMe SMART log page for VFIO NVMe — is
-                        // entirely handled by the pool backend; see `PoolOps::read_device_health`.
-                        let result = pool
-                            .read_device_health(&uri)
-                            .await
-                            .map_err(|error| error.to_string());
+                    let list_args = ListPoolArgs {
+                        name: args.name,
+                        backend: pool_type.map(Into::into),
+                        uuid: args.uuid,
+                    };
+                    let mut pools = Vec::new();
 
-                        disks.push(DiskHealth {
-                            disk_uri: uri,
-                            supported: result.is_ok(),
-                            error: result.as_ref().err().cloned(),
-                            health: result.ok().map(DeviceHealth::from),
-                        });
+                    for factory in GrpcPoolFactory::factories() {
+                        if list_args.backend.is_some()
+                            && list_args.backend != Some(factory.backend())
+                        {
+                            continue;
+                        }
+                        match factory.list_ops(&list_args).await {
+                            Ok(found) => {
+                                for pool in found {
+                                    let uris = pool.disks();
+                                    let mut disks = Vec::with_capacity(uris.len());
+                                    for uri in uris {
+                                        let result = pool
+                                            .read_device_health(&uri)
+                                            .await
+                                            .map_err(|error| error.to_string());
+
+                                        disks.push(DiskHealth {
+                                            disk_uri: uri,
+                                            supported: result.is_ok(),
+                                            error: result.as_ref().err().cloned(),
+                                            health: result.ok().map(DeviceHealth::from),
+                                        });
+                                    }
+                                    pools.push(PoolHealth {
+                                        name: pool.name().to_string(),
+                                        uuid: pool.uuid(),
+                                        disks,
+                                    });
+                                }
+                            }
+                            Err(error) => {
+                                let backend = factory.0.as_factory().backend();
+                                tracing::error!(
+                                    "Failed to list pool health of type {backend:?}, error: {error}"
+                                );
+                            }
+                        }
                     }
 
-                    Ok(GetPoolHealthResponse { disks })
+                    Ok(ListPoolHealthResponse { pools })
                 })
             },
         )

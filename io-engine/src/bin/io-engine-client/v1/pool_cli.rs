@@ -40,8 +40,8 @@ enum PoolCommands {
     ClearErrors(ClearErrorsArgs),
     /// Probes storage pool
     Probe(ProbeArgs),
-    /// Get SMART / health of the pool's disk(s)
-    GetHealth(GetHealthArgs),
+    /// List SMART / health of pool disk(s)
+    ListHealth(ListHealthArgs),
 }
 
 #[derive(Debug, Args)]
@@ -97,11 +97,14 @@ struct DestroyArgs {
 }
 
 #[derive(Debug, Args)]
-struct GetHealthArgs {
-    /// Storage pool name
-    pool: String,
+struct ListHealthArgs {
+    /// Storage pool name (optional; lists all pools if omitted)
+    #[arg(short = 'n', long)]
+    name: Option<String>,
     #[arg(short = 'u', long)]
     uuid: Option<Uuid>,
+    #[arg(short = 't', long = "type")]
+    pool_type: Option<PoolType>,
 }
 
 #[derive(Debug, Args)]
@@ -179,7 +182,7 @@ pub async fn handler(ctx: Context, args: PoolArgs) -> crate::Result<()> {
         PoolCommands::List(args) => list(ctx, args).await,
         PoolCommands::ClearErrors(args) => clear_errors(ctx, args).await,
         PoolCommands::Probe(args) => probe(ctx, args).await,
-        PoolCommands::GetHealth(args) => get_health(ctx, args).await,
+        PoolCommands::ListHealth(args) => list_health(ctx, args).await,
     }
 }
 
@@ -660,14 +663,16 @@ async fn probe(mut ctx: Context, args: ProbeArgs) -> crate::Result<()> {
     Ok(())
 }
 
-async fn get_health(mut ctx: Context, args: GetHealthArgs) -> crate::Result<()> {
-    let name = args.pool;
+async fn list_health(mut ctx: Context, args: ListHealthArgs) -> crate::Result<()> {
     let response = ctx
         .v1
         .pool
-        .get_pool_health(v1rpc::pool::GetPoolHealthRequest {
-            name: name.clone(),
+        .list_pool_health(v1rpc::pool::ListPoolHealthOptions {
+            name: args.name,
             uuid: args.uuid.map(|u| u.to_string()),
+            pooltype: args.pool_type.map(|t| v1rpc::pool::PoolTypeValue {
+                value: v1rpc::pool::PoolType::from(t) as i32,
+            }),
         })
         .await
         .context(GrpcStatus)?

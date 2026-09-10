@@ -21,7 +21,7 @@
 //! pass-through ioctls internally).
 //!
 //! NOTE: `smartctl` is a subprocess call that blocks until it completes.
-//! [`read_device_health`] is called from an SPDK reactor (the `GetPoolHealth`
+//! [`read_device_health`] is called from an SPDK reactor (the `ListPoolHealth`
 //! gRPC handler runs inside `spdk_submit!`), so it trampolines the actual
 //! subprocess execution onto the tokio runtime (same off-reactor pattern as
 //! `lvm::tokio_submit`/`tokio_run!`) rather than blocking the calling reactor
@@ -98,7 +98,7 @@ pub struct SmartAttribute {
 /// decoded either from the raw 64-byte log entry (VFIO path) or from
 /// `smartctl`'s `nvme_error_information_log.table` (kernel path). Only
 /// non-empty slots are surfaced -- see [`parse_nvme_error_log`]. Surfaced
-/// over `GetPoolHealth`'s gRPC response as `DeviceHealth::error_log_entries`
+/// over `ListPoolHealth`'s gRPC response as `DeviceHealth::error_log_entries`
 /// (see `grpc/v1/pool.rs`'s `DeviceHealth`/`NvmeErrorLogEntry` `From` impls).
 #[derive(Debug, Clone, Default)]
 pub struct NvmeErrorLogEntry {
@@ -121,7 +121,7 @@ pub struct NvmeErrorLogEntry {
 /// name. Identity requires a separate NVMe Identify Controller admin command
 /// from the health log page, and — unlike health — never changes, so it's
 /// fetched once per device and reused rather than re-issued on every
-/// `GetPoolHealth` call.
+/// `ListPoolHealth` call.
 static NVME_IDENTITY_CACHE: Lazy<Mutex<HashMap<String, DeviceIdentity>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -345,7 +345,7 @@ pub fn identity_from_nvme_identify(data: &[u8]) -> Option<DeviceIdentity> {
 /// `smartctl --json --all`.
 ///
 /// Runs the subprocess off the calling SPDK reactor: when called from an SPDK
-/// thread (the normal case -- `GetPoolHealth` runs inside `spdk_submit!`),
+/// thread (the normal case -- `ListPoolHealth` runs inside `spdk_submit!`),
 /// the blocking `Command::output()` is trampolined onto the tokio runtime and
 /// the result hopped back onto the primary reactor before returning, instead
 /// of blocking the reactor for `smartctl`'s duration. See the module docs.
@@ -391,7 +391,7 @@ async fn run_smartctl(path: &str) -> Result<DeviceHealth, CoreError> {
         .await
         .map_err(|error| {
             // Capture the real error string into the returned error (not just a
-            // log line) so it's visible to the GetPoolHealth caller too, via
+            // log line) so it's visible to the ListPoolHealth caller too, via
             // DiskHealth::error -- CoreError::NotSupported alone would only
             // carry the generic Errno, losing this detail.
             let reason = format!("failed to spawn smartctl for '{path}': {error}");
@@ -781,10 +781,7 @@ mod tests {
         ))
         .unwrap();
         let id = parse_smartctl_identity(&j);
-        assert_eq!(
-            id.wwn,
-            Some(format!("{naa:x}{oui:06x}{id_num:010x}"))
-        );
+        assert_eq!(id.wwn, Some(format!("{naa:x}{oui:06x}{id_num:010x}")));
     }
 
     #[test]
